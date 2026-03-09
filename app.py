@@ -1,19 +1,9 @@
 """
-GX Schedule Optimizer - Production Version v2
-Features:
+GX Schedule Optimizer - Production Version v3
+- Shows ALL arena formats (not just trainer-detected)
 - Google OAuth (restricted to @curefit.com)
-- Modern UI with Cult.fit branding
-- Multi-select format dropdown per center
-- Ready for Render.com deployment
-
-To run locally:
-    pip install flask pandas numpy ortools openpyxl requests
-    python flask_app_prod.py
-
-Environment variables needed:
-    GOOGLE_CLIENT_ID=your_client_id
-    GOOGLE_CLIENT_SECRET=your_client_secret
-    SECRET_KEY=your_random_secret_key
+- Metabase query links for data download
+- Dance → DF mapping
 """
 
 from flask import Flask, render_template_string, request, jsonify, send_file, redirect, url_for, session
@@ -23,7 +13,6 @@ import numpy as np
 from datetime import datetime, timedelta
 import tempfile
 import os
-import json
 
 from ortools.sat.python import cp_model
 
@@ -40,22 +29,55 @@ ALLOWED_DOMAIN = 'curefit.com'
 DEV_MODE = os.environ.get('DEV_MODE', 'true').lower() == 'true'
 
 # =============================================================================
+# METABASE QUERY LINKS (Update these with your actual links)
+# =============================================================================
+
+METABASE_LINKS = {
+    'center_data': os.environ.get('METABASE_CENTER_LINK', 'https://metabase.curefit.co/question/XXXXX'),
+    'trainer_data': os.environ.get('METABASE_TRAINER_LINK', 'https://metabase.curefit.co/question/XXXXX'),
+    'historical_data': os.environ.get('METABASE_HISTORICAL_LINK', 'https://metabase.curefit.co/question/XXXXX'),
+}
+
+# =============================================================================
 # CONFIGURATION
 # =============================================================================
 
 class Config:
     DAYS = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday']
     DAY_TO_NUM = {d: i+1 for i, d in enumerate(DAYS)}
+    
+    # All formats available per arena type
     ARENA_FORMATS = {
         1.0: ['HRX', 'S&C', 'DF', 'Yoga', 'Burn'],
         1.5: ['HRX', 'S&C', 'DF', 'Yoga', 'Boxing', 'Burn'],
         2.0: ['HRX', 'S&C', 'DF', 'Yoga', 'Burn'],
+        3.0: ['HRX', 'S&C', 'DF', 'Yoga', 'Boxing', 'Burn'],
+        4.0: ['HRX', 'S&C', 'DF', 'Yoga', 'Boxing', 'Burn'],
     }
-    ARENA_CAPACITY = {1.0: 1, 1.5: 2, 2.0: 2}
+    
+    # Format name mappings (trainer file → standard name)
+    FORMAT_MAPPING = {
+        'Dance': 'DF',
+        'dance': 'DF',
+        'DANCE': 'DF',
+        'Dance Fitness': 'DF',
+        'S&C': 'S&C',
+        'SC': 'S&C',
+        'Strength': 'S&C',
+        'HRX': 'HRX',
+        'Yoga': 'Yoga',
+        'yoga': 'Yoga',
+        'Burn': 'Burn',
+        'Boxing': 'Boxing',
+    }
+    
+    ARENA_CAPACITY = {1.0: 1, 1.5: 2, 2.0: 2, 3.0: 3, 4.0: 4}
     ARENA_DAILY_MAX = {
         1.0: {'Yoga': 2, 'HRX_SC': 5, 'DF': 2, 'Boxing_Burn': 0},
         1.5: {'Yoga': 2, 'HRX_SC': 5, 'DF': 2, 'Boxing_Burn': 5},
         2.0: {'Yoga': 4, 'HRX_SC': 10, 'DF': 4, 'Boxing_Burn': 0},
+        3.0: {'Yoga': 5, 'HRX_SC': 10, 'DF': 4, 'Boxing_Burn': 5},
+        4.0: {'Yoga': 10, 'HRX_SC': 15, 'DF': 8, 'Boxing_Burn': 10},
     }
     OPEN_HOUR, CLOSE_HOUR = 6, 22
     DEAD_ZONE_START, DEAD_ZONE_END = 11, 16
@@ -139,7 +161,6 @@ MAIN_PAGE = '''
         * { box-sizing: border-box; margin: 0; padding: 0; }
         body { font-family: 'Inter', sans-serif; background: var(--gray); color: #333; line-height: 1.6; }
         
-        /* Header */
         .header { background: linear-gradient(135deg, var(--dark) 0%, var(--dark-light) 100%); color: white; position: sticky; top: 0; z-index: 100; box-shadow: 0 4px 20px rgba(0,0,0,0.2); }
         .header-content { max-width: 1400px; margin: 0 auto; padding: 20px 30px; display: flex; justify-content: space-between; align-items: center; }
         .brand { display: flex; align-items: center; gap: 15px; }
@@ -153,7 +174,6 @@ MAIN_PAGE = '''
         
         .container { max-width: 1400px; margin: 0 auto; padding: 30px; }
         
-        /* Steps */
         .step { background: white; border-radius: 16px; margin-bottom: 24px; box-shadow: 0 4px 15px rgba(0,0,0,0.05); overflow: hidden; }
         .step:hover { box-shadow: 0 8px 25px rgba(0,0,0,0.1); }
         .step-header { background: var(--dark); color: white; padding: 20px 25px; display: flex; align-items: center; gap: 15px; }
@@ -161,7 +181,14 @@ MAIN_PAGE = '''
         .step-title { font-size: 18px; font-weight: 600; }
         .step-content { padding: 25px; }
         
-        /* File Upload */
+        /* Metabase Links Section */
+        .data-links { background: linear-gradient(135deg, #E3F2FD 0%, #BBDEFB 100%); border-radius: 12px; padding: 20px; margin-bottom: 25px; border: 1px solid #90CAF9; }
+        .data-links h3 { color: #1565C0; margin-bottom: 15px; font-size: 16px; display: flex; align-items: center; gap: 8px; }
+        .data-links-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 12px; }
+        .data-link { display: flex; align-items: center; gap: 10px; padding: 12px 16px; background: white; border-radius: 8px; text-decoration: none; color: #1565C0; font-weight: 500; transition: all 0.3s; border: 1px solid #90CAF9; }
+        .data-link:hover { background: #1565C0; color: white; transform: translateY(-2px); box-shadow: 0 4px 12px rgba(21,101,192,0.3); }
+        .data-link-icon { font-size: 20px; }
+        
         .upload-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 20px; margin-bottom: 25px; }
         .upload-box { border: 2px dashed #ddd; border-radius: 12px; padding: 30px; text-align: center; transition: all 0.3s; cursor: pointer; position: relative; }
         .upload-box:hover { border-color: var(--red); background: #FFF5F5; }
@@ -172,7 +199,6 @@ MAIN_PAGE = '''
         .upload-hint { font-size: 13px; color: var(--gray-dark); }
         .file-name { margin-top: 10px; font-size: 13px; color: var(--green); font-weight: 500; }
         
-        /* Buttons */
         .btn { display: inline-flex; align-items: center; justify-content: center; gap: 10px; padding: 14px 28px; border: none; border-radius: 10px; font-size: 16px; font-weight: 600; cursor: pointer; transition: all 0.3s; text-decoration: none; }
         .btn-primary { background: linear-gradient(135deg, var(--red) 0%, var(--red-dark) 100%); color: white; box-shadow: 0 4px 15px rgba(229,57,53,0.3); }
         .btn-primary:hover { transform: translateY(-2px); box-shadow: 0 8px 25px rgba(229,57,53,0.4); }
@@ -182,7 +208,6 @@ MAIN_PAGE = '''
         .btn-lg { padding: 18px 36px; font-size: 18px; }
         .btn-full { width: 100%; }
         
-        /* Status */
         .status { padding: 20px; border-radius: 12px; margin-top: 20px; display: flex; align-items: flex-start; gap: 15px; }
         .status-icon { font-size: 24px; flex-shrink: 0; }
         .status.success { background: linear-gradient(135deg, #E8F5E9 0%, #C8E6C9 100%); border: 1px solid #A5D6A7; }
@@ -195,7 +220,6 @@ MAIN_PAGE = '''
         .summary-card .value { font-size: 32px; font-weight: 700; color: var(--red); }
         .summary-card .label { font-size: 13px; color: var(--gray-dark); margin-top: 5px; }
         
-        /* Table */
         .table-container { overflow-x: auto; margin-top: 20px; border-radius: 12px; border: 1px solid #e0e0e0; }
         .center-table { width: 100%; border-collapse: collapse; }
         .center-table th { background: var(--dark); color: white; padding: 14px 16px; text-align: left; font-weight: 600; font-size: 13px; text-transform: uppercase; letter-spacing: 0.5px; white-space: nowrap; }
@@ -206,8 +230,7 @@ MAIN_PAGE = '''
         .checkbox-wrapper { display: flex; align-items: center; justify-content: center; }
         .checkbox-wrapper input[type="checkbox"] { width: 20px; height: 20px; accent-color: var(--red); cursor: pointer; }
         
-        /* Multi-select dropdown */
-        .multiselect-container { position: relative; min-width: 200px; }
+        .multiselect-container { position: relative; min-width: 220px; }
         .multiselect-display { display: flex; flex-wrap: wrap; gap: 4px; padding: 8px 12px; border: 2px solid #e0e0e0; border-radius: 8px; background: white; cursor: pointer; min-height: 42px; align-items: center; transition: all 0.3s; }
         .multiselect-display:hover { border-color: var(--red); }
         .multiselect-display.open { border-color: var(--red); box-shadow: 0 0 0 3px rgba(229,57,53,0.1); }
@@ -232,17 +255,16 @@ MAIN_PAGE = '''
         .multiselect-option .format-dot.df { background: #E65100; }
         .multiselect-option .format-dot.burn { background: #AD1457; }
         .multiselect-option .format-dot.boxing { background: #2E7D32; }
+        .multiselect-option .trainer-badge { font-size: 10px; padding: 2px 6px; border-radius: 10px; background: #E8F5E9; color: #2E7D32; margin-left: auto; }
+        .multiselect-option .no-trainer-badge { font-size: 10px; padding: 2px 6px; border-radius: 10px; background: #FFF3E0; color: #E65100; margin-left: auto; }
         
-        /* Yoga Select */
         .select-wrapper select { padding: 10px 35px 10px 15px; border: 2px solid #e0e0e0; border-radius: 8px; background: white url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 12 12'%3E%3Cpath fill='%23333' d='M6 8L1 3h10z'/%3E%3C/svg%3E") no-repeat right 12px center; appearance: none; font-size: 14px; font-weight: 500; cursor: pointer; min-width: 180px; transition: all 0.3s; }
         .select-wrapper select:hover { border-color: var(--red); }
         .select-wrapper select:focus { outline: none; border-color: var(--red); box-shadow: 0 0 0 3px rgba(229,57,53,0.1); }
         .select-wrapper select:disabled { background-color: #f5f5f5; color: #999; cursor: not-allowed; }
         
-        .no-formats { color: var(--red); font-weight: 500; font-size: 13px; }
         .action-row { display: flex; gap: 10px; margin-bottom: 20px; }
         
-        /* Progress Log */
         .progress-log { background: var(--dark); border-radius: 12px; padding: 20px; margin-top: 20px; font-family: 'Monaco', 'Menlo', monospace; font-size: 13px; max-height: 250px; overflow-y: auto; }
         .progress-log .log-entry { padding: 8px 0; border-bottom: 1px solid rgba(255,255,255,0.1); color: #ccc; }
         .progress-log .log-entry:last-child { border-bottom: none; }
@@ -250,7 +272,6 @@ MAIN_PAGE = '''
         .progress-log .error { color: #FF5252; }
         .progress-log .pending { color: #64B5F6; }
         
-        /* Results */
         .results-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 20px; margin-bottom: 30px; }
         .result-card { background: linear-gradient(135deg, #fff 0%, var(--gray) 100%); border-radius: 16px; padding: 25px; text-align: center; border: 1px solid #e0e0e0; }
         .result-card .icon { font-size: 32px; margin-bottom: 10px; }
@@ -302,6 +323,26 @@ MAIN_PAGE = '''
                 <span class="step-title">Upload Data Files</span>
             </div>
             <div class="step-content">
+                <!-- Metabase Links -->
+                <div class="data-links">
+                    <h3>📊 Download Data from Metabase</h3>
+                    <p style="margin-bottom: 15px; color: #1565C0; font-size: 14px;">Click each link below, run the query, and download as CSV:</p>
+                    <div class="data-links-grid">
+                        <a href="{{ metabase_links.center_data }}" target="_blank" class="data-link">
+                            <span class="data-link-icon">🏢</span>
+                            <span>Center Data Query</span>
+                        </a>
+                        <a href="{{ metabase_links.trainer_data }}" target="_blank" class="data-link">
+                            <span class="data-link-icon">👥</span>
+                            <span>Trainer Data Query</span>
+                        </a>
+                        <a href="{{ metabase_links.historical_data }}" target="_blank" class="data-link">
+                            <span class="data-link-icon">📈</span>
+                            <span>Historical Data Query</span>
+                        </a>
+                    </div>
+                </div>
+                
                 <form id="uploadForm" enctype="multipart/form-data">
                     <div class="upload-grid">
                         <div class="upload-box" id="box-center">
@@ -339,7 +380,7 @@ MAIN_PAGE = '''
                 <span class="step-title">Configure Centers</span>
             </div>
             <div class="step-content">
-                <p style="margin-bottom: 15px; color: #666;">Select centers, choose formats to include, and configure Yoga Monday preferences:</p>
+                <p style="margin-bottom: 15px; color: #666;">Select centers, choose formats to include (including freelancer formats), and configure Yoga Monday preferences:</p>
                 <div class="action-row">
                     <button type="button" class="btn btn-secondary" onclick="selectAll(true)">✅ Select All</button>
                     <button type="button" class="btn btn-secondary" onclick="selectAll(false)">❌ Clear All</button>
@@ -351,7 +392,7 @@ MAIN_PAGE = '''
                                 <th style="width: 50px;">Select</th>
                                 <th>Center Name</th>
                                 <th style="width: 70px;">Arena</th>
-                                <th style="width: 240px;">Formats to Include</th>
+                                <th style="width: 280px;">Formats to Include</th>
                                 <th style="width: 180px;">Yoga Monday</th>
                             </tr>
                         </thead>
@@ -404,7 +445,6 @@ MAIN_PAGE = '''
     <script>
         let centerData = [];
         
-        // File upload handlers
         ['center', 'trainer', 'historical'].forEach(type => {
             const input = document.getElementById(`${type}_file`);
             const box = document.getElementById(`box-${type}`);
@@ -420,7 +460,6 @@ MAIN_PAGE = '''
             });
         });
         
-        // Close dropdowns when clicking outside
         document.addEventListener('click', function(e) {
             if (!e.target.closest('.multiselect-container')) {
                 document.querySelectorAll('.multiselect-dropdown').forEach(d => d.classList.remove('show'));
@@ -474,7 +513,6 @@ MAIN_PAGE = '''
             const display = document.getElementById(`formats_display_${idx}`);
             const isOpen = dropdown.classList.contains('show');
             
-            // Close all others
             document.querySelectorAll('.multiselect-dropdown').forEach(d => d.classList.remove('show'));
             document.querySelectorAll('.multiselect-display').forEach(d => d.classList.remove('open'));
             
@@ -495,8 +533,6 @@ MAIN_PAGE = '''
                 display.innerHTML = selected.map(f => `<span class="tag ${getFormatClass(f)}">${f}</span>`).join('');
             }
             
-            // Update yoga dropdown visibility
-            const yogaSelect = document.getElementById(`yoga_${idx}`);
             const yogaCell = document.getElementById(`yoga_cell_${idx}`);
             if (yogaCell) {
                 if (selected.includes('Yoga')) {
@@ -518,39 +554,47 @@ MAIN_PAGE = '''
             tbody.innerHTML = '';
             
             centerData.forEach((center, idx) => {
-                const hasFormats = center.formats.length > 0;
-                const hasYoga = center.formats.includes('Yoga');
+                const allFormats = center.all_formats;  // All formats for this arena
+                const trainerFormats = center.trainer_formats;  // Formats with trainers
+                const hasYoga = allFormats.includes('Yoga');
                 
-                // Build format multi-select
-                let formatSelectHtml = '';
-                if (hasFormats) {
-                    const options = center.formats.map(f => `
+                // Build format options with trainer/no-trainer badges
+                const options = allFormats.map(f => {
+                    const hasTrainer = trainerFormats.includes(f);
+                    const badge = hasTrainer 
+                        ? '<span class="trainer-badge">Has trainer</span>'
+                        : '<span class="no-trainer-badge">Freelancer</span>';
+                    const checked = hasTrainer ? 'checked' : '';  // Pre-select only formats with trainers
+                    return `
                         <div class="multiselect-option">
-                            <input type="checkbox" id="fmt_${idx}_${f}" value="${f}" checked onchange="updateFormatDisplay(${idx})">
+                            <input type="checkbox" id="fmt_${idx}_${f}" value="${f}" ${checked} onchange="updateFormatDisplay(${idx})">
                             <label for="fmt_${idx}_${f}">
                                 <span class="format-dot ${getFormatClass(f)}"></span>
                                 ${f}
                             </label>
-                        </div>
-                    `).join('');
-                    
-                    const tags = center.formats.map(f => `<span class="tag ${getFormatClass(f)}">${f}</span>`).join('');
-                    
-                    formatSelectHtml = `
-                        <div class="multiselect-container">
-                            <div class="multiselect-display" id="formats_display_${idx}" onclick="toggleDropdown(${idx})">
-                                ${tags}
-                            </div>
-                            <div class="multiselect-dropdown" id="formats_dropdown_${idx}">
-                                ${options}
-                            </div>
+                            ${badge}
                         </div>
                     `;
-                } else {
-                    formatSelectHtml = '<span class="no-formats">⚠️ No trainers</span>';
-                }
+                }).join('');
                 
-                const yogaHtml = hasYoga 
+                // Initial display - only trainer formats
+                const initialTags = trainerFormats.length > 0
+                    ? trainerFormats.map(f => `<span class="tag ${getFormatClass(f)}">${f}</span>`).join('')
+                    : '<span class="multiselect-placeholder">Select formats...</span>';
+                
+                const formatSelectHtml = `
+                    <div class="multiselect-container">
+                        <div class="multiselect-display" id="formats_display_${idx}" onclick="toggleDropdown(${idx})">
+                            ${initialTags}
+                        </div>
+                        <div class="multiselect-dropdown" id="formats_dropdown_${idx}">
+                            ${options}
+                        </div>
+                    </div>
+                `;
+                
+                const hasYogaTrainer = trainerFormats.includes('Yoga');
+                const yogaHtml = hasYogaTrainer 
                     ? `<div class="select-wrapper">
                         <select id="yoga_${idx}">
                             <option value="Optimizer">🤖 Optimizer Decides</option>
@@ -562,7 +606,7 @@ MAIN_PAGE = '''
                 
                 tbody.innerHTML += `
                     <tr>
-                        <td><div class="checkbox-wrapper"><input type="checkbox" id="select_${idx}" ${hasFormats ? 'checked' : 'disabled'}></div></td>
+                        <td><div class="checkbox-wrapper"><input type="checkbox" id="select_${idx}" ${trainerFormats.length > 0 ? 'checked' : ''}></div></td>
                         <td><strong>${center.name}</strong></td>
                         <td style="text-align: center; font-weight: 600;">${center.arena}</td>
                         <td>${formatSelectHtml}</td>
@@ -575,7 +619,7 @@ MAIN_PAGE = '''
         function selectAll(checked) {
             centerData.forEach((center, idx) => {
                 const cb = document.getElementById(`select_${idx}`);
-                if (!cb.disabled) cb.checked = checked;
+                if (cb) cb.checked = checked;
             });
         }
         
@@ -659,26 +703,43 @@ MAIN_PAGE = '''
 # DATA FUNCTIONS
 # =============================================================================
 
-def detect_formats(center_name, trainer_df, arena):
+def normalize_format(fmt):
+    """Normalize format names (Dance → DF, etc.)"""
+    fmt = str(fmt).strip()
+    return Config.FORMAT_MAPPING.get(fmt, fmt)
+
+def detect_trainer_formats(center_name, trainer_df, arena):
+    """Detect formats that have trainers assigned"""
     if 'home_center_2' in trainer_df.columns:
         trainers = trainer_df[(trainer_df['home_center'] == center_name) | (trainer_df['home_center_2'] == center_name)]
     else:
         trainers = trainer_df[trainer_df['home_center'] == center_name]
+    
     formats = set()
     for fmt in trainers['format'].unique():
-        formats.add(fmt)
-        if fmt == 'S&C':
+        normalized = normalize_format(fmt)
+        formats.add(normalized)
+        if normalized == 'S&C':
             formats.add('HRX')
-            if arena in [1.0, 2.0]: formats.add('Burn')
-        if fmt == 'Boxing': formats.add('Burn')
+            if arena in [1.0, 2.0]:
+                formats.add('Burn')
+        if normalized == 'Boxing':
+            formats.add('Burn')
+    
     arena_fmts = set(Config.ARENA_FORMATS.get(arena, Config.ARENA_FORMATS[1.0]))
     return sorted(formats & arena_fmts)
+
+def get_all_arena_formats(arena):
+    """Get all possible formats for an arena type"""
+    return Config.ARENA_FORMATS.get(arena, Config.ARENA_FORMATS[1.0])
 
 def build_intelligence(df):
     df = df.copy()
     df['class_date'] = pd.to_datetime(df['class_date'], format='%B %d, %Y', errors='coerce')
     df['util'] = (df['total_attendance'] / df['total_capacity'] * 100).clip(0, 100)
     df['day_name'] = df['day_of_week'].map({i: d for i, d in enumerate(Config.DAYS, 1)})
+    # Normalize format names in historical data
+    df['format'] = df['format'].apply(normalize_format)
     cutoff = df['class_date'].max() - timedelta(weeks=8)
     recent = df[df['class_date'] >= cutoff]
     scores = {key: grp['util'].mean() for key, grp in recent.groupby(['center_name', 'day_name', 'class_start_hour', 'format'])}
@@ -692,13 +753,14 @@ def build_validator(center_df, trainer_df):
         centers = [row['home_center']]
         if 'home_center_2' in row.index and row['home_center_2'] and row['home_center_2'] != 'nan':
             centers.append(row['home_center_2'])
+        fmt = normalize_format(row['format'])
         for center in centers:
             if not center or center == 'nan': continue
-            key = (center, row['format'])
+            key = (center, fmt)
             offs.setdefault(key, []).append(row['weekly_off'])
             counts[key] = counts.get(key, 0) + 1
             if row['gender'] == 'Female':
-                female.setdefault(center, set()).add(row['format'])
+                female.setdefault(center, set()).add(fmt)
     return {'arenas': arenas, 'offs': offs, 'counts': counts, 'female': female}
 
 def get_score(intel, c, d, h, f):
@@ -860,7 +922,12 @@ def create_excel(results):
 @login_required
 def index():
     user = get_current_user()
-    return render_template_string(MAIN_PAGE, user_name=user.get('name', 'User'), user_initial=user.get('name', 'U')[0].upper(), dev_mode=DEV_MODE)
+    return render_template_string(MAIN_PAGE, 
+        user_name=user.get('name', 'User'), 
+        user_initial=user.get('name', 'U')[0].upper(), 
+        dev_mode=DEV_MODE,
+        metabase_links=METABASE_LINKS
+    )
 
 @app.route('/login')
 def login():
@@ -913,7 +980,18 @@ def upload():
         STATE['intel'] = build_intelligence(historical_df)
         STATE['validator'] = build_validator(center_df, trainer_df)
         
-        centers = [{'name': row['center_name'], 'arena': row['arena'], 'formats': detect_formats(row['center_name'], trainer_df, row['arena'])} for _, row in center_df.iterrows()]
+        centers = []
+        for _, row in center_df.iterrows():
+            c = row['center_name']
+            arena = row['arena']
+            trainer_formats = detect_trainer_formats(c, trainer_df, arena)
+            all_formats = get_all_arena_formats(arena)
+            centers.append({
+                'name': c, 
+                'arena': arena, 
+                'trainer_formats': trainer_formats,  # Formats with trainers
+                'all_formats': all_formats  # All possible formats for this arena
+            })
         STATE['center_info'] = {c['name']: c for c in centers}
         
         return jsonify({'success': True, 'summary': {'centers': len(center_df), 'trainers': len(trainer_df), 'records': len(historical_df)}, 'centers': centers})
@@ -930,10 +1008,10 @@ def optimize():
         
         for item in selected:
             center = item['name']
-            formats = item.get('formats', STATE['center_info'].get(center, {}).get('formats', []))
+            formats = item.get('formats', [])
             yoga_pref = item.get('yoga_pref', 'Optimizer')
             
-            log.append(f"⏳ Optimizing {center} ({len(formats)} formats)...")
+            log.append(f"⏳ Optimizing {center} ({len(formats)} formats: {', '.join(formats)})...")
             result = optimize_center(center, formats, yoga_pref, STATE['intel'], STATE['validator'])
             results[center] = result
             
