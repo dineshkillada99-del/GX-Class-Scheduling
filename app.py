@@ -33,9 +33,9 @@ DEV_MODE = os.environ.get('DEV_MODE', 'true').lower() == 'true'
 # =============================================================================
 
 METABASE_LINKS = {
-    'center_data': os.environ.get('METABASE_CENTER_LINK', 'https://metabase.curefit.co/question/XXXXX'),
+    'center_data': os.environ.get('METABASE_CENTER_LINK', 'https://metabase.curefit.co/question/74219'),
     'trainer_data': os.environ.get('METABASE_TRAINER_LINK', 'https://metabase.curefit.co/question/XXXXX'),
-    'historical_data': os.environ.get('METABASE_HISTORICAL_LINK', 'https://metabase.curefit.co/question/XXXXX'),
+    'historical_data': os.environ.get('METABASE_HISTORICAL_LINK', 'https://metabase.curefit.co/question/74218'),
 }
 
 # =============================================================================
