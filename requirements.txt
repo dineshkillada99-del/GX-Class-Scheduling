@@ -1,0 +1,7 @@
+flask==3.0.0
+pandas==2.1.4
+numpy==1.26.3
+ortools==9.8.3296
+openpyxl==3.1.2
+requests==2.31.0
+gunicorn==21.2.0
